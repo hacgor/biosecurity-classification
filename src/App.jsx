@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
+import { runClassification, IBT_INDICES, FC1_MAX_PCT, FC3_MIN_PCT } from "./classification.js";
 
 // ─── LOCAL STORAGE SHIM ────────────────────────────────────────────────────
 // Replaces Claude artifact's window.storage API with localStorage for standalone use
@@ -218,8 +219,8 @@ const TOPICS = {
   K: "Working organisation and equipment",
 };
 
-// IBT indices (cols 139-149 in Excel = topics B through External score)
-const IBT_INDICES = [138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148];
+// IBT_INDICES, the classification algorithm and its thresholds now live in
+// ./classification.js (imported above) so they can be unit tested.
 
 // ─── STYLES ─────────────────────────────────────────────────────────────────
 const theme = {
@@ -247,102 +248,8 @@ function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
-function percentile(arr, val) {
-  if (arr.length === 0) return 0;
-  const sorted = [...arr].sort((a, b) => a - b);
-  let count = 0;
-  for (const v of sorted) {
-    if (v < val) count++;
-    else if (v === val) count += 0.5;
-  }
-  return (count / sorted.length) * 100;
-}
-
-function classifyByPercentile(pct) {
-  if (pct <= 25) return "FC1";
-  if (pct <= 75) return "FC2";
-  return "FC3";
-}
-
-function runClassification(farms, sbmCriteria, selectedIBT) {
-  if (farms.length === 0) return [];
-
-  // Only use selected IBT topics for Scale 2
-  const activeIBT = selectedIBT && selectedIBT.length > 0 ? selectedIBT : IBT_INDICES;
-
-  // Extract score arrays for percentile computation
-  const totalScores = farms.map((f) => f.scores?.[151] ?? 0);
-  const externalScores = farms.map((f) => f.scores?.[149] ?? 0);
-  const internalScores = farms.map((f) => f.scores?.[150] ?? 0);
-
-  // IBT scores arrays (only selected topics)
-  const ibtArrays = {};
-  for (const idx of activeIBT) {
-    ibtArrays[idx] = farms.map((f) => f.scores?.[idx] ?? 0);
-  }
-
-  return farms.map((farm) => {
-    const totalPct = percentile(totalScores, farm.scores?.[151] ?? 0);
-    const extPct = percentile(externalScores, farm.scores?.[149] ?? 0);
-    const intPct = percentile(internalScores, farm.scores?.[150] ?? 0);
-
-    // Scale 1: classification based on total, external, internal percentiles
-    const scale1Class = classifyByPercentile(Math.min(totalPct, extPct, intPct));
-
-    // Scale 2: classification based on selected IBT percentiles only
-    const ibtPcts = activeIBT.map((idx) =>
-      percentile(ibtArrays[idx], farm.scores?.[idx] ?? 0)
-    );
-    const minIbtPct = ibtPcts.length > 0 ? Math.min(...ibtPcts) : 100;
-    const scale2Class = classifyByPercentile(minIbtPct);
-
-    // Scale 3: SBM check using regex
-    let scale3Pass = true;
-    const sbmDetails = [];
-    for (const crit of sbmCriteria) {
-      const farmAnswer = String(farm.answers?.[crit.questionIdx] ?? "").trim();
-      let pass = false;
-      let regexError = null;
-      try {
-        const re = new RegExp(crit.regexPattern, "i");
-        pass = re.test(farmAnswer);
-      } catch (e) {
-        regexError = e.message;
-        pass = false;
-      }
-      if (!pass) scale3Pass = false;
-      sbmDetails.push({
-        questionIdx: crit.questionIdx,
-        questionNum: crit.questionNum,
-        questionText: crit.questionText,
-        regexPattern: crit.regexPattern,
-        actual: farm.answers?.[crit.questionIdx] ?? "(no answer)",
-        pass,
-        regexError,
-      });
-    }
-
-    // Final classification
-    // Worst of scale1 and scale2, then check scale3
-    const scaleClasses = [scale1Class, scale2Class];
-    let combined = "FC3";
-    if (scaleClasses.includes("FC1")) combined = "FC1";
-    else if (scaleClasses.includes("FC2")) combined = "FC2";
-
-    // If scale3 fails, downgrade to FC1
-    if (!scale3Pass && sbmCriteria.length > 0) combined = "FC1";
-
-    return {
-      farmId: farm.id,
-      farmName: farm.name,
-      scale1: { classification: scale1Class, totalPct, extPct, intPct },
-      scale2: { classification: scale2Class, ibtPcts, minIbtPct, activeIBT },
-      scale3: { pass: scale3Pass, details: sbmDetails },
-      finalClassification: combined,
-      scores: farm.scores,
-    };
-  });
-}
+// percentile(), classify() and runClassification() live in ./classification.js
+// (imported at the top of this file) so the algorithm can be unit tested.
 
 // ─── COMPONENTS ─────────────────────────────────────────────────────────────
 function Badge({ type, children }) {
@@ -1246,7 +1153,12 @@ function ClassificationResults({ results, processName }) {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                   <Badge type={r.finalClassification}>{r.finalClassification}</Badge>
-                  <span style={{ fontWeight: 600, color: theme.text, fontSize: 14 }}>{r.farmName}</span>
+                  <div style={{ minWidth: 0 }}>
+                    <span style={{ fontWeight: 600, color: theme.text, fontSize: 14 }}>{r.farmName}</span>
+                    {r.reason && (
+                      <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>{r.reason}</div>
+                    )}
+                  </div>
                 </div>
                 <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <span style={{ fontSize: 11, color: theme.textDim }}>
@@ -1261,23 +1173,49 @@ function ClassificationResults({ results, processName }) {
 
             {expandedFarm === r.farmId && (
               <div style={{ marginTop: 14, borderTop: `1px solid ${theme.border}`, paddingTop: 14 }}>
+                {/* Classification reason(s) */}
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 6 }}>
+                    Why {r.finalClassification}?
+                  </div>
+                  <div style={{ display: "grid", gap: 4 }}>
+                    {(r.reasons || [r.reason]).map((reason, i) => {
+                      const tone = r.finalClassification === "FC1" ? theme.fc1
+                        : r.finalClassification === "FC2" ? theme.fc2 : theme.fc3;
+                      const bg = r.finalClassification === "FC1" ? "rgba(239,68,68,0.08)"
+                        : r.finalClassification === "FC2" ? "rgba(245,158,11,0.08)" : "rgba(16,185,129,0.08)";
+                      return (
+                        <div key={i} style={{
+                          fontSize: 11, padding: "4px 8px", borderRadius: 4,
+                          background: bg, color: tone, border: `1px solid ${tone}33`,
+                        }}>
+                          {reason}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 {/* Scale 1 */}
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 6 }}>
                     Scale 1 — Score Distribution
-                    <Badge type={r.scale1.classification} style={{ marginLeft: 8 }}>
-                      {r.scale1.classification}
+                    <Badge type={r.scale1.triggersFC1 ? "FC1" : "dim"} style={{ marginLeft: 8 }}>
+                      {r.scale1.triggersFC1 ? "FC1 trigger" : "no FC1 trigger"}
                     </Badge>
+                  </div>
+                  <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 6 }}>
+                    Any percentile ≤ {FC1_MAX_PCT} forces FC1. The Total percentile alone decides FC2 vs FC3.
                   </div>
                   <div style={{ display: "flex", gap: 16, fontSize: 11, color: theme.textMuted }}>
                     <span>
-                      Total percentile: <b style={{ color: theme.text }}>{r.scale1.totalPct.toFixed(1)}%</b>
+                      Total percentile: <b style={{ color: r.scale1.totalPct <= FC1_MAX_PCT ? theme.fc1 : theme.text }}>{r.scale1.totalPct.toFixed(1)}%</b>
                     </span>
                     <span>
-                      External percentile: <b style={{ color: theme.text }}>{r.scale1.extPct.toFixed(1)}%</b>
+                      External percentile: <b style={{ color: r.scale1.extPct <= FC1_MAX_PCT ? theme.fc1 : theme.text }}>{r.scale1.extPct.toFixed(1)}%</b>
                     </span>
                     <span>
-                      Internal percentile: <b style={{ color: theme.text }}>{r.scale1.intPct.toFixed(1)}%</b>
+                      Internal percentile: <b style={{ color: r.scale1.intPct <= FC1_MAX_PCT ? theme.fc1 : theme.text }}>{r.scale1.intPct.toFixed(1)}%</b>
                     </span>
                   </div>
                 </div>
@@ -1286,12 +1224,15 @@ function ClassificationResults({ results, processName }) {
                 <div style={{ marginBottom: 14 }}>
                   <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 6 }}>
                     Scale 2 — Important Biosecurity Topics
-                    <Badge type={r.scale2.classification} style={{ marginLeft: 8 }}>
-                      {r.scale2.classification}
+                    <Badge type={r.scale2.triggersFC1 ? "FC1" : "dim"} style={{ marginLeft: 8 }}>
+                      {r.scale2.triggersFC1 ? "FC1 trigger" : "no FC1 trigger"}
                     </Badge>
                   </div>
+                  <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 6 }}>
+                    Any selected IBT percentile ≤ {FC1_MAX_PCT} forces FC1. IBT does not affect the FC2 vs FC3 split.
+                  </div>
                   <div style={{ fontSize: 11, color: theme.textMuted, marginBottom: 4 }}>
-                    Min IBT percentile: <b style={{ color: theme.text }}>{r.scale2.minIbtPct.toFixed(1)}%</b>
+                    Min IBT percentile: <b style={{ color: r.scale2.minIbtPct <= FC1_MAX_PCT ? theme.fc1 : theme.text }}>{r.scale2.minIbtPct.toFixed(1)}%</b>
                     {r.scale2.activeIBT && r.scale2.activeIBT.length < IBT_INDICES.length && (
                       <span style={{ marginLeft: 8 }}>({r.scale2.activeIBT.length} of {IBT_INDICES.length} topics selected)</span>
                     )}
@@ -1300,16 +1241,18 @@ function ClassificationResults({ results, processName }) {
                     {(r.scale2.activeIBT || IBT_INDICES).map((idx, i) => {
                       const label = TOPIC_INDICES[idx]?.split(". ")[0] || idx;
                       const pct = r.scale2.ibtPcts[i];
+                      const low = pct <= FC1_MAX_PCT;
                       return (
                         <span
                           key={idx}
+                          title={low ? `≤ ${FC1_MAX_PCT} — forces FC1` : "above FC1 threshold"}
                           style={{
                             padding: "2px 8px",
                             borderRadius: 4,
                             fontSize: 10,
-                            background: pct <= 25 ? "rgba(239,68,68,0.1)" : pct <= 75 ? "rgba(245,158,11,0.1)" : "rgba(16,185,129,0.1)",
-                            color: pct <= 25 ? theme.fc1 : pct <= 75 ? theme.fc2 : theme.fc3,
-                            border: `1px solid ${pct <= 25 ? "rgba(239,68,68,0.2)" : pct <= 75 ? "rgba(245,158,11,0.2)" : "rgba(16,185,129,0.2)"}`,
+                            background: low ? "rgba(239,68,68,0.1)" : "rgba(16,185,129,0.1)",
+                            color: low ? theme.fc1 : theme.fc3,
+                            border: `1px solid ${low ? "rgba(239,68,68,0.2)" : "rgba(16,185,129,0.2)"}`,
                           }}
                         >
                           {label}: {pct.toFixed(0)}%

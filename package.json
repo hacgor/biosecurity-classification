@@ -6,6 +6,7 @@
   "description": "Farm Biosecurity Classification System — 3-Scale Selection Model PoC",
   "scripts": {
     "dev": "vite",
+    "test": "node --test",
     "build": "vite build",
     "preview": "vite preview",
     "predeploy": "npm run build",

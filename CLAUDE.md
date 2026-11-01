@@ -17,18 +17,19 @@ This is a **PoC-grade** application — prioritize working features and correctn
 
 ## Architecture
 
-### Single-File App (`src/App.jsx`)
+### App (`src/App.jsx`) + algorithm module (`src/classification.js`)
 
-The entire application lives in one file. This is intentional for PoC scope — do not split into multiple files unless explicitly asked. The file is structured in this order:
+The UI is a single file (`src/App.jsx`) — intentional for PoC scope; do not split the UI into more files unless explicitly asked. The **pure classification algorithm** was extracted into `src/classification.js` so it can be unit tested without a JSX/React runtime; `App.jsx` imports `runClassification`, `IBT_INDICES`, `FC1_MAX_PCT`, `FC3_MIN_PCT` from it. `App.jsx` is structured in this order:
 
-1. **Imports + storage shim** (localStorage polyfill for standalone mode)
+1. **Imports + storage shim** (localStorage polyfill for standalone mode); imports the algorithm from `./classification.js`
 2. **QUESTIONS array** — all 124 questionnaire items with `{ idx, num, text, topic }` where `idx` is the Excel column index (0-based)
-3. **Index constants** — `SCORE_COLS`, `TOPIC_INDICES` (cols 138–148), `AGGREGATE_INDICES` (cols 149–151), `IBT_INDICES` (cols 138–148), `TOPICS` map (A–K)
+3. **Index constants** — `SCORE_COLS`, `TOPIC_INDICES` (cols 138–148), `AGGREGATE_INDICES` (cols 149–151), `TOPICS` map (A–K). `IBT_INDICES` is imported from `classification.js`
 4. **Theme object** — dark theme color tokens
-5. **Classification algorithm** — `percentile()`, `classifyByPercentile()`, `runClassification()`
-6. **UI components** — Badge, Button, Card, Input (generic)
-7. **Feature components** — IBTConfig, SBMConfig, ExcelImport, ManualEntry, FarmList, ClassificationResults, ProcessDetail
-8. **App root** — state management, persistent storage, routing via view state
+5. **UI components** — Badge, Button, Card, Input (generic)
+6. **Feature components** — IBTConfig, SBMConfig, ExcelImport, ManualEntry, FarmList, ClassificationResults, ProcessDetail
+7. **App root** — state management, persistent storage, routing via view state
+
+`src/classification.js` holds `percentile()`, `classify()` (the pure decision rule), `runClassification()`, the threshold constants `FC1_MAX_PCT`/`FC3_MIN_PCT`, and the column constants. `src/classification.test.js` covers it (`npm test`, which runs Node's built-in `node --test`).
 
 ### Data Model
 
@@ -80,30 +81,38 @@ Row 0 in Excel = question headers. Rows 1+ = farm data.
 ## Classification Algorithm — 3-Scale Selection Model
 
 **This is the core of the application. Changes here must be verified carefully.**
+The algorithm lives in [`src/classification.js`](src/classification.js) (`percentile`, `classify`, `runClassification`) — kept out of `App.jsx` so it can be unit tested (`npm test`). The thresholds are the named constants `FC1_MAX_PCT = 25` and `FC3_MIN_PCT = 75`.
+
+Classification runs per process over **all** farms in that process; percentiles are computed relative to the other farms in the **same** process.
 
 ### Scale 1 — Score Distribution
 - Takes three scores per farm: Total (col 151), External (col 149), Internal (col 150)
-- Computes each farm's **percentile within the set** of all farms in the classification process
-- Classification = based on the **minimum** percentile across all three
-- Thresholds: ≤25% → FC1, >25% and ≤75% → FC2, >75% → FC3
+- Computes each farm's **percentile within the set** of all farms in the classification process (one percentile per score)
 
 ### Scale 2 — Important Biosecurity Topics (IBT)
 - Uses **only the topics selected** by the expert (stored in `process.selectedIBT`)
 - Available topics: A–K (cols 138–148) — **NOT External score (col 149)**
-- Same percentile + threshold logic as Scale 1
-- Classification = based on the **minimum** percentile across selected topics
-- If no topics selected, Scale 2 is skipped (all farms pass)
+- Computes one percentile per selected topic
+- If no topics selected, Scale 2 contributes nothing (cannot trigger FC1)
 
 ### Scale 3 — Specific Biosecurity Measures (SBM)
 - Expert defines criteria: question + **regex pattern** for valid answer
 - Each farm's answer is tested with `new RegExp(pattern, "i").test(answer)`
-- **Any single failed criterion** → farm fails Scale 3
-- Failure → farm is downgraded to **FC1 regardless** of Scale 1 and 2 results
+- A farm **PASSES only if every** listed criterion matches; **any single failure** fails Scale 3
 
-### Final Classification
-1. Compute Scale 1 result and Scale 2 result independently
-2. Combined = **worst** of Scale 1 and Scale 2 (FC1 < FC2 < FC3)
-3. If Scale 3 fails → override to FC1
+### Final Classification (per farm, in this exact order)
+1. **FC1 "Poor"** if **any** of the following is true:
+   - any Scale 1 percentile (Total, External **or** Internal) is **≤ 25**
+   - any selected Scale 2 IBT percentile is **≤ 25**
+   - Scale 3 **fails** (at least one SBM question lacks its required answer)
+2. Otherwise, look **only** at the Scale 1 **Total** percentile:
+   - Total **> 25 and ≤ 75** → **FC2 "Medium"**
+   - Total **> 75** → **FC3 "Good"**
+   - External, Internal and IBT percentiles are **not** used to choose between FC2 and FC3.
+
+> **Changed vs. the previous logic:** previously FC2/FC3 was the *worst* classification across all of Scale 1 and Scale 2. Now, once a farm passes the FC1 check, **only the Total percentile** decides FC2 vs FC3.
+
+Each farm result carries `reason` (primary) and `reasons[]` strings explaining its class, e.g. `"FC1: External percentile 18 <= 25"`, `"FC1: SBM Q42 wrong answer"`, `"FC3: Total percentile 82 > 75"`. These are surfaced in `ClassificationResults`.
 
 ### Percentile Calculation
 Uses midpoint method: values below get full credit, ties get half credit.
@@ -151,7 +160,7 @@ function percentile(arr, val) {
 
 | Decision | Rationale |
 |----------|-----------|
-| Single JSX file | PoC scope — minimal project structure, easy to iterate |
+| Single JSX file for the UI | PoC scope — minimal project structure, easy to iterate. The pure algorithm is the one exception: it lives in `src/classification.js` so it can be unit tested without React |
 | No router | Only 3-4 "views" managed via state string — router is overkill |
 | Dark theme | Domain users (agricultural biosecurity) often work in field conditions; dark theme reduces glare |
 | Regex for Scale 3 | Exact string matching was too rigid for real-world answers that may have variable formatting (e.g., "cleaned: Always \| disinfected: Always") |
@@ -167,12 +176,15 @@ function percentile(arr, val) {
 2. If it has an associated score column, add the index to `SCORE_COLS`
 
 ### Changing classification thresholds
-Edit `classifyByPercentile()` — currently ≤25 → FC1, ≤75 → FC2, >75 → FC3
+Edit the named constants `FC1_MAX_PCT` (currently 25) and `FC3_MIN_PCT` (currently 75) in `src/classification.js`. The decision rule in `classify()` reads them, and `App.jsx` imports them for the results UI. Update `src/classification.test.js` if boundary behavior changes.
+
+### Changing the FC2 vs FC3 decision
+Only the **Total** percentile decides FC2 vs FC3 (see `classify()` in `src/classification.js`). The FC1 check still considers every Scale 1 percentile, every selected IBT percentile, and Scale 3.
 
 ### Adding a new topic
-1. Add to `TOPICS` object
-2. Add column index to `TOPIC_INDICES`
-3. Add column index to `IBT_INDICES`
+1. Add to `TOPICS` object (in `App.jsx`)
+2. Add column index to `TOPIC_INDICES` (in `App.jsx`)
+3. Add column index to `IBT_INDICES` (in `src/classification.js`)
 4. Update `SCORE_FIELDS` in the ManualEntry section
 
 ### Changing the base path for deployment
